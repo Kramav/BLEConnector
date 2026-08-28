@@ -1,0 +1,56 @@
+# =====================================================================
+#  Build toolchain for OLA_Accel_BLE.ino
+#
+#  Build context MUST be the OpenLog_Artemis repo's Firmware/ directory --
+#  it needs Extras/UartPower3.zip from there. scripts/build_firmware.ps1
+#  (or .sh) stages that for you; see README.md.
+#
+#  Stripped derivative of SparkFun's Firmware/Dockerfile: same core, same
+#  core patches, but 2 libraries instead of 33 and a single stage.
+# =====================================================================
+FROM ubuntu:latest
+
+RUN apt-get update && apt-get install -y curl unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# arduino-cli. The installer places it on PATH; no ENV line needed.
+RUN curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+
+# SparkFun Apollo3 core 2.2.1 -- the version OLA v2.11 is built against.
+# NOTE: --additional-urls belongs on `config init`, not a separate `config add`.
+RUN arduino-cli config init --additional-urls https://raw.githubusercontent.com/sparkfun/Arduino_Apollo3/main/package_sparkfun_apollo3_index.json
+RUN arduino-cli core update-index
+RUN arduino-cli core install "Sparkfun:apollo3@2.2.1"
+
+# Libraries. ONLY these two are needed.
+# NOTE the quoting: the @version goes OUTSIDE the quotes. Inside, arduino-cli
+# searches for a library literally named "...Arduino Library@1.3.0" and fails.
+RUN arduino-cli lib install "SparkFun 9DoF IMU Breakout - ICM 20948 - Arduino Library"@1.3.0
+
+# ArduinoBLE 1.1.3 IS NOT A PREFERENCE. Versions >= 1.2.0 compile without a
+# single warning and then hard-fault at runtime on Apollo3 core 2.x, because
+# the core pins a SparkFun fork of Mbed 5 whose BLE API diverged from Mbed 6.
+# See Arduino_Apollo3 issues #362 and #291. Do not bump this.
+RUN arduino-cli lib install "ArduinoBLE"@1.1.3
+
+# --- UartPower3 core patch, paths copied from SparkFun's Dockerfile ---
+# The zip extracts its six files FLAT into the current directory; it does not
+# create a UartPower3/ subdirectory. Three of the six destinations are not
+# where you would guess. If a cp fails the build stops -- that is the good
+# outcome, and it means the core layout changed.
+COPY Extras/UartPower3.zip /Extras/
+RUN cd /Extras \
+    && unzip -o -q UartPower3.zip \
+    && cp HardwareSerial.h    /root/.arduino15/packages/SparkFun/hardware/apollo3/2.2.1/cores/arduino/mbed-bridge/core-extend/HardwareSerial.h \
+    && cp HardwareSerial.cpp  /root/.arduino15/packages/SparkFun/hardware/apollo3/2.2.1/cores/arduino/mbed-bridge/core-implement/HardwareSerial.cpp \
+    && cp UnbufferedSerial.h  /root/.arduino15/packages/SparkFun/hardware/apollo3/2.2.1/cores/mbed-os/drivers/UnbufferedSerial.h \
+    && cp serial_api.c        /root/.arduino15/packages/SparkFun/hardware/apollo3/2.2.1/cores/mbed-os/targets/TARGET_Ambiq_Micro/TARGET_Apollo3/device/serial_api.c \
+    && cp libmbed-os.a        /root/.arduino15/packages/SparkFun/hardware/apollo3/2.2.1/variants/SFE_ARTEMIS_ATP/mbed/libmbed-os.a \
+    && cp SPI.cpp             /root/.arduino15/packages/SparkFun/hardware/apollo3/2.2.1/libraries/SPI/src/SPI.cpp
+
+# Everything above this line is cached across rebuilds, so edit-compile-flash
+# iterations only rerun the two steps below.
+COPY OLA_Accel_BLE /OLA_Accel_BLE
+RUN cd /OLA_Accel_BLE \
+    && arduino-cli compile -v -e -b SparkFun:apollo3:sfe_artemis_atp OLA_Accel_BLE.ino
+RUN cp /OLA_Accel_BLE/build/SparkFun.apollo3.sfe_artemis_atp/OLA_Accel_BLE.ino.bin /
