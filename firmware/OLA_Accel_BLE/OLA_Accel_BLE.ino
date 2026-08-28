@@ -81,9 +81,14 @@ const byte PIN_PWR_LED             = 29;
 
 #define DEVICE_NAME  "OLA-ACCEL"
 
-BLEService        accelService(UUID_SERVICE);
-BLECharacteristic dataChar  (UUID_DATA,   BLENotify,            PACKET_BYTES);
-BLECharacteristic statusChar(UUID_STATUS, BLERead | BLENotify,  14);
+BLEService accelService(UUID_SERVICE);
+
+// BLERead alongside BLENotify, matching the working example in
+// OpenLog_Artemis issue #66 (BLERead | BLEWrite | BLENotify). A notify-only
+// characteristic is legal, but a readable one is what is known to work on
+// this core, and it lets a central read the last value without subscribing.
+BLECharacteristic dataChar  (UUID_DATA,   BLERead | BLENotify, PACKET_BYTES);
+BLECharacteristic statusChar(UUID_STATUS, BLERead | BLENotify, 14);
 
 ICM_20948_SPI myICM;
 
@@ -193,6 +198,28 @@ void setup() {
   configureOutput(PIN_PWR_LED);  digitalWrite(PIN_PWR_LED,  LOW);
   configureOutput(PIN_STAT_LED); digitalWrite(PIN_STAT_LED, LOW);
 
+  // ---- BLE first ----
+  // Order matters, and this is the order the known-working sketch in
+  // OpenLog_Artemis issue #66 uses: the whole BLE block runs before SPI and
+  // the IMU are touched. BLE.begin() brings up the Cordio stack and starts
+  // its RTOS thread; starting it after a second of 4 MHz SPI traffic and
+  // IMU power cycling is the one structural difference that remained
+  // between this sketch and the example that works on this hardware.
+  if (!BLE.begin())
+    fatalBlink(FAULT_BLE_STACK, "BLE.begin() failed -- check ArduinoBLE is 1.1.3");
+
+  BLE.setLocalName(DEVICE_NAME);        // the example sets only the local
+                                        // name, not setDeviceName()
+  BLE.setAdvertisedService(accelService);
+  accelService.addCharacteristic(dataChar);
+  accelService.addCharacteristic(statusChar);
+  BLE.addService(accelService);
+  BLE.advertise();
+
+#if DEBUG_SERIAL
+  Serial.println("advertising as " DEVICE_NAME);
+#endif
+
   // Keep the Qwiic rail off -- we use no Qwiic devices.
   configureOutput(PIN_QWIIC_POWER);
   digitalWrite(PIN_QWIIC_POWER, QWIIC_POWER_OFF_LEVEL);
@@ -220,18 +247,8 @@ void setup() {
   if (configureIMU() != ICM_20948_Stat_Ok)
     fatalBlink(FAULT_IMU_CONFIG, "IMU answered but rejected its configuration");
 
-  if (!BLE.begin()) fatalBlink(FAULT_BLE_STACK, "BLE.begin() failed -- check ArduinoBLE is 1.1.3");
-
-  BLE.setLocalName(DEVICE_NAME);
-  BLE.setDeviceName(DEVICE_NAME);
-  BLE.setAdvertisedService(accelService);
-  accelService.addCharacteristic(dataChar);
-  accelService.addCharacteristic(statusChar);
-  BLE.addService(accelService);
-  BLE.advertise();
-
 #if DEBUG_SERIAL
-  Serial.println("advertising as " DEVICE_NAME);
+  Serial.println("IMU configured -- ready");
 #endif
 }
 

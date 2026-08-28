@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 
 from ola_ble import BleakClient, BleakScanner, require_bleak, run
 from ola_protocol import DEVICE_NAME, UUID_DATA, UUID_SERVICE, UUID_STATUS
@@ -72,8 +73,39 @@ async def inspect(args):
         print(f"NOT FOUND: no peripheral named {args.name}.")
         return 1
 
-    print(f"connecting to {dev.address} ...\n")
-    async with BleakClient(dev) as client:
+    # Each step is timed and reported separately: "timeout" means something
+    # very different depending on whether it happened during the connection,
+    # during service discovery, or during the CCCD write that start_notify
+    # performs.
+    async def step(label, coro, timeout):
+        t0 = time.monotonic()
+        print(f"  {label} ... ", end="", flush=True)
+        try:
+            result = await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            print(f"TIMEOUT after {time.monotonic() - t0:.1f} s")
+            raise
+        except Exception as exc:  # noqa: BLE001 - reporting, not handling
+            print(f"FAILED after {time.monotonic() - t0:.1f} s: "
+                  f"[{type(exc).__name__}] {exc}")
+            raise
+        print(f"ok ({time.monotonic() - t0:.1f} s)")
+        return result
+
+    client = BleakClient(dev, timeout=args.connect_timeout, pair=args.pair)
+    print(f"connecting to {dev.address}"
+          f"{' with pairing' if args.pair else ''} ...")
+    try:
+        await step("connect", client.connect(), args.connect_timeout + 5)
+    except Exception:
+        print(
+            "\nThe connection itself failed. On Windows, forget the device under\n"
+            "Settings > Bluetooth & devices and retry -- a cached GATT table from\n"
+            "earlier firmware causes exactly this."
+        )
+        return 1
+
+    try:
         print(f"connected: {client.is_connected}\n")
 
         wanted = {
@@ -119,12 +151,24 @@ async def inspect(args):
             counts["status"] += 1
             print(f"  status packet: {len(d)} bytes  {bytes(d).hex()}")
 
-        await client.start_notify(UUID_STATUS, on_status)
-        await client.start_notify(UUID_DATA, on_data)
+        try:
+            await step("subscribe status", client.start_notify(UUID_STATUS, on_status), 20)
+            await step("subscribe data", client.start_notify(UUID_DATA, on_data), 20)
+        except Exception:
+            print(
+                "\nConnected and discovered services, but subscribing failed.\n"
+                "That is the CCCD write. Check the board's serial log: if it\n"
+                "never prints 'subscribed -- streaming', the write never arrived."
+            )
+            return 1
+
         await asyncio.sleep(5.0)
         if client.is_connected:
             await client.stop_notify(UUID_DATA)
             await client.stop_notify(UUID_STATUS)
+    finally:
+        if client.is_connected:
+            await client.disconnect()
 
     print(
         f"\n{counts['data']} data packets ({counts['bytes']} bytes), "
@@ -150,6 +194,12 @@ def parse_args(argv=None):
         "--connect",
         action="store_true",
         help="connect and dump the GATT table, then test-subscribe",
+    )
+    p.add_argument(
+        "--connect-timeout", type=float, default=20.0, help="connect timeout"
+    )
+    p.add_argument(
+        "--pair", action="store_true", help="pair on connect (Windows sometimes needs it)"
     )
     return p.parse_args(argv)
 
