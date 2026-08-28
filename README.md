@@ -14,10 +14,12 @@ build-and-run path.
 > (23%), no warnings from the sketch — which confirms the library API details
 > the guide flagged as unverified: the `ICM_20948_smplrt_t.a` field name, the
 > `agmt.acc.axes.x` accessor, the DLPF/full-scale enums, and `dataReady()`.
-> The host half is tested against synthetic streams. What still needs hardware:
-> whether `writeValue()` returns false on a full TX queue (the mechanism
-> losslessness rests on), whether `central.connected()` alone services the BLE
-> stack, the power-rail polarities, and the actual ODR. Section
+> The host half is tested against synthetic streams. The power-rail polarities
+> and the Apollo3 pin/SPI init are now taken from stock OLA firmware's
+> `lowerPower.ino` and `beginIMU()` rather than assumed. What still needs
+> hardware: whether `writeValue()` returns false on a full TX queue (the
+> mechanism losslessness rests on), whether `central.connected()` alone services
+> the BLE stack, and the actual ODR. Section
 > [Verify on hardware](#5--verify-on-hardware) is ordered so those fail earliest.
 
 ```
@@ -163,15 +165,37 @@ packets never arrived. In a healthy run both are zero.
 
 | Symptom | Cause |
 |---------|-------|
-| Status LED blinks 2 / 3 / 4 forever | IMU not found / IMU config failed / BLE stack failed |
+| Status LED blinks 2 / 3 / 4 forever | IMU not found / IMU config failed / BLE stack failed — for blink 2 see below |
 | Compiles cleanly, board dead on boot | ArduinoBLE ≥ 1.2.0 — repin to 1.1.3 |
-| All readings exactly zero | IMU power pin polarity, or wrong chip select. Flip `IMU_POWER_ON_LEVEL` in the sketch |
+| All readings exactly zero | IMU powered but not sampling — check `PIN_IMU_CHIP_SELECT` is 44 for your board revision |
 | Readings 2×, 4×, or 8× off | `ACCEL_FS_G` and the `fss.a` enum disagree |
 | Advertises but won't connect | something else is connected — BLE takes one central. Un-pair it in Windows Bluetooth settings |
 | Constant `gap` messages when close | backpressure not working — see test 4 |
 | `OVERFLOWED` whenever you walk away | raise `RING_SAMPLES`; you have RAM headroom |
 | Link dies a second or two after connecting | set `EXPLICIT_BLE_POLL 1` in the sketch |
 | Time axis folds back after ~11.6 min | the 16-bit `seq` wrap — `ola_protocol.py` handles it; a custom reader may not |
+
+### Blink 2 — "IMU not found"
+
+`myICM.begin()` failed every attempt. Work down this list:
+
+1. **Power-cycle the board** — unplug and replug, not just reset. `beginIMU()`
+   power-cycles the ICM itself, but a cold start is the cleanest test.
+2. **Set `DEBUG_SERIAL` to 1**, reflash, open a serial monitor at 115200. It
+   prints `myICM.status` per attempt, which separates "no response at all" from
+   "responded with the wrong WHO_AM_I" (a bus/pull-up problem).
+3. **Set `MICROSD_POWER_OFF` to 0** and reflash. That powers the card like stock
+   firmware does, ruling out an unpowered microSD loading the shared SPI bus.
+4. **Confirm the board revision.** `PIN_IMU_CHIP_SELECT` is 44 on the V10; the
+   X04 differs, and every pin in the map is then wrong.
+
+Three things the sketch already does, which are easy to lose if you edit setup()
+and are exactly what stock firmware does — see `beginIMU()` in
+`OpenLog_Artemis.ino` and `imuPowerOn()` in `lowerPower.ino`: every `pinMode`
+is paired with `pin_config()` (on Apollo3 `pinMode` alone may not re-configure a
+pad, so a rail looks driven in code and reads dead on the board); the CIPO line
+gets a 1.5K pull-up *after* `SPI.begin()`; and the ICM is power-cycled before
+each `begin()` attempt rather than merely powered on.
 
 The `⚠️` items in the guide's [§12](openlog-artemis-ble-streaming-guide.md) list
 exactly which API details are unverified: the `ICM_20948_smplrt_t.a` field name,

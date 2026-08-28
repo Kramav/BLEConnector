@@ -33,15 +33,24 @@ const byte PIN_IMU_POWER           = 27;
 const byte PIN_MICROSD_CHIP_SELECT = 23;
 const byte PIN_MICROSD_POWER       = 15;
 const byte PIN_QWIIC_POWER         = 18;
+const byte PIN_SPI_CIPO            = 6;
 const byte PIN_STAT_LED            = 19;
 const byte PIN_PWR_LED             = 29;
 
-// Power-rail polarity. These match stock OLA firmware usage, but verify
-// them on your board: getting IMU power backwards leaves every reading at
-// zero, which is what test 6 in the guide catches.
+// Power-rail polarity, read out of stock OLA firmware's lowerPower.ino
+// (imuPowerOn/Off, microSDPowerOn/Off, qwiicPowerOn/Off) for
+// HARDWARE_VERSION_MAJOR 1. Note the Qwiic rail is the odd one out: HIGH
+// enables it on V10 and disables it on the X04, so this is not guesswork you
+// can carry between boards.
 #define IMU_POWER_ON_LEVEL       HIGH
-#define MICROSD_POWER_OFF_LEVEL  HIGH
-#define QWIIC_POWER_OFF_LEVEL    HIGH
+#define MICROSD_POWER_OFF_LEVEL  HIGH   // LOW powers the card
+#define QWIIC_POWER_OFF_LEVEL    LOW    // V10: HIGH powers the Qwiic bus
+
+// The microSD shares the SPI bus with the IMU. Leaving its rail off is the
+// point of this build, but if the IMU will not init, set this to 0 to power
+// the card like stock firmware does -- that rules out an unpowered card
+// loading the bus. Costs current; only useful as a diagnostic.
+#define MICROSD_POWER_OFF        1
 
 // ---------------- Configuration ----------------
 // ODR = 1125 / (1 + ACCEL_SMPLRT_DIV).  3 -> 281.25 Hz.  See guide section 2.
@@ -99,6 +108,42 @@ void pumpIMU();
 void pumpBLE();
 void sendStatus();
 void fatalBlink(int code);
+void configureOutput(byte pin);
+void enableCIPOpullUp();
+void imuPowerOn();
+void imuPowerOff();
+bool beginIMU();
+
+// ---------------------------------------------------------------------
+// On Apollo3, pinMode() alone does not reliably re-configure a pad that was
+// previously set up for another function -- stock OLA firmware pairs every
+// pinMode with this call, commented "Make sure the pin does actually get
+// re-configured". Omitting it is why a power rail can look driven in code
+// and read dead on the board.
+void configureOutput(byte pin) {
+  pinMode(pin, OUTPUT);
+  pin_config(PinName(pin), g_AM_HAL_GPIO_OUTPUT);
+}
+
+// A 1.5K pull-up on the shared SPI CIPO line. Without it the line can float
+// between transfers and the IMU's WHO_AM_I read comes back as garbage, which
+// presents exactly as "IMU not found". From OpenLog_Artemis.ino's
+// enableCIPOpullUp(), updated there for Apollo3 core 2.1.0.
+void enableCIPOpullUp() {
+  am_hal_gpio_pincfg_t cipoPinCfg = g_AM_BSP_GPIO_IOM0_MISO;
+  cipoPinCfg.ePullup = AM_HAL_GPIO_PIN_PULLUP_1_5K;
+  pin_config(PinName(PIN_SPI_CIPO), cipoPinCfg);
+}
+
+void imuPowerOn() {
+  configureOutput(PIN_IMU_POWER);
+  digitalWrite(PIN_IMU_POWER, IMU_POWER_ON_LEVEL);
+}
+
+void imuPowerOff() {
+  configureOutput(PIN_IMU_POWER);
+  digitalWrite(PIN_IMU_POWER, !IMU_POWER_ON_LEVEL);
+}
 
 static inline uint32_t ringCount() {
   return (head >= tail) ? (head - tail) : (RING_SAMPLES - tail + head);
@@ -112,30 +157,28 @@ void setup() {
   Serial.println("OLA-ACCEL starting");
 #endif
 
-  pinMode(PIN_PWR_LED,  OUTPUT); digitalWrite(PIN_PWR_LED,  LOW);
-  pinMode(PIN_STAT_LED, OUTPUT); digitalWrite(PIN_STAT_LED, LOW);
+  configureOutput(PIN_PWR_LED);  digitalWrite(PIN_PWR_LED,  LOW);
+  configureOutput(PIN_STAT_LED); digitalWrite(PIN_STAT_LED, LOW);
 
-  // Power the IMU; keep microSD and Qwiic rails off -- we use neither.
-  pinMode(PIN_IMU_POWER,     OUTPUT); digitalWrite(PIN_IMU_POWER,     IMU_POWER_ON_LEVEL);
-  pinMode(PIN_MICROSD_POWER, OUTPUT); digitalWrite(PIN_MICROSD_POWER, MICROSD_POWER_OFF_LEVEL);
-  pinMode(PIN_QWIIC_POWER,   OUTPUT); digitalWrite(PIN_QWIIC_POWER,   QWIIC_POWER_OFF_LEVEL);
+  // Keep the Qwiic rail off -- we use no Qwiic devices.
+  configureOutput(PIN_QWIIC_POWER);
+  digitalWrite(PIN_QWIIC_POWER, QWIIC_POWER_OFF_LEVEL);
 
-  // The microSD shares the SPI bus with the IMU. Its rail is off, so leave
-  // its chip select high-impedance rather than driving a high level into an
-  // unpowered part.
-  pinMode(PIN_MICROSD_CHIP_SELECT, INPUT);
+  configureOutput(PIN_MICROSD_POWER);
+  digitalWrite(PIN_MICROSD_POWER,
+               MICROSD_POWER_OFF ? MICROSD_POWER_OFF_LEVEL : !MICROSD_POWER_OFF_LEVEL);
 
-  delay(100);                       // let the IMU rail settle before SPI
+  // Both SPI devices deselected before anything drives the bus.
+  configureOutput(PIN_MICROSD_CHIP_SELECT);
+  digitalWrite(PIN_MICROSD_CHIP_SELECT, HIGH);
+  configureOutput(PIN_IMU_CHIP_SELECT);
+  digitalWrite(PIN_IMU_CHIP_SELECT, HIGH);
 
   SPI.begin();
+  delay(2);                         // stock notes SPI needs a moment here
+  enableCIPOpullUp();               // must come after SPI.begin()
 
-  bool ok = false;
-  for (int attempt = 0; attempt < 5 && !ok; attempt++) {
-    myICM.begin(PIN_IMU_CHIP_SELECT, SPI, 4000000);
-    ok = (myICM.status == ICM_20948_Stat_Ok);
-    if (!ok) delay(200);
-  }
-  if (!ok) fatalBlink(FAULT_IMU_NOT_FOUND);
+  if (!beginIMU()) fatalBlink(FAULT_IMU_NOT_FOUND);
 
   if (configureIMU() != ICM_20948_Stat_Ok) fatalBlink(FAULT_IMU_CONFIG);
 
@@ -152,6 +195,37 @@ void setup() {
 #if DEBUG_SERIAL
   Serial.println("advertising as " DEVICE_NAME);
 #endif
+}
+
+// ---------------------------------------------------------------------
+// Bring the ICM-20948 up, power-cycling it on each attempt.
+//
+// The power cycle is not optional: stock firmware resets the ICM this way
+// every time, because a warm restart -- a reflash, or a watchdog reset --
+// can leave the part in a state where begin() fails. The datasheet gives
+// 11 ms typical and 100 ms maximum for start-up, so the first attempt waits
+// 25 ms and later ones wait the full 100 ms.
+bool beginIMU() {
+  for (int attempt = 0; attempt < 3; attempt++) {
+    imuPowerOff();
+    delay(10);
+    imuPowerOn();
+    delay(attempt == 0 ? 25 : 100);
+
+    digitalWrite(PIN_IMU_CHIP_SELECT, HIGH);   // be sure it is deselected
+
+    myICM.begin(PIN_IMU_CHIP_SELECT, SPI, 4000000);
+    if (myICM.status == ICM_20948_Stat_Ok) {
+      delay(25);                    // stock waits again before configuring
+      return true;
+    }
+
+#if DEBUG_SERIAL
+    Serial.print("beginIMU attempt "); Serial.print(attempt);
+    Serial.print(" failed, status = "); Serial.println(myICM.status);
+#endif
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------

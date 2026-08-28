@@ -14,18 +14,14 @@ once-every-two-seconds blink means the firmware is healthy and advertising.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import sys
 
-try:
-    from bleak import BleakScanner
-except ImportError:  # pragma: no cover - dependency hint
-    sys.exit("bleak is not installed.  pip install -r requirements.txt")
-
+from ola_ble import BleakScanner, require_bleak, run
 from ola_protocol import DEVICE_NAME, UUID_SERVICE
 
 
 async def scan(args):
+    require_bleak()
     print(f"scanning for {args.timeout:.0f} s ...\n")
     found = await BleakScanner.discover(timeout=args.timeout, return_adv=True)
 
@@ -71,7 +67,4 @@ def parse_args(argv=None):
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(asyncio.run(scan(parse_args())))
-    except KeyboardInterrupt:
-        sys.exit(130)
+    sys.exit(run(scan(parse_args())))

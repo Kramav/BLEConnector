@@ -20,12 +20,10 @@ import sys
 import time
 from datetime import datetime, timezone
 
-try:
-    from bleak import BleakClient, BleakScanner
-except ImportError:  # pragma: no cover - dependency hint
-    # Deferred so ola_simulate.py can reuse the CSV pipeline without bleak.
-    BleakClient = BleakScanner = None
 
+# Imported from ola_ble so ola_simulate.py can reuse the CSV pipeline even
+# when bleak is not installed.
+from ola_ble import BleakClient, BleakScanner, require_bleak, run
 from ola_protocol import (
     DEVICE_NAME,
     UUID_DATA,
@@ -144,11 +142,6 @@ class Receiver:
         self.sink.mark_primed()
         if not self.quiet:
             print(f"  status: {status.describe()}")
-
-
-def require_bleak():
-    if BleakScanner is None:
-        sys.exit("bleak is not installed.  pip install -r host/requirements.txt")
 
 
 async def find_device(args):
@@ -319,7 +312,4 @@ def parse_args(argv=None):
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(stream(parse_args()))
-    except KeyboardInterrupt:
-        pass
+    sys.exit(run(stream(parse_args())))
