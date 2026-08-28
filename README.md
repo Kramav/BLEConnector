@@ -9,12 +9,16 @@ This is the implementation of [openlog-artemis-ble-streaming-guide.md](openlog-a
 The guide explains *why* every number here is what it is; this README is the
 build-and-run path.
 
-> **Not yet flashed to hardware.** The firmware is derived from the OLA repo's
-> own pin map, build configuration, and library APIs, but has not been compiled
-> against real headers or run on a board. The host half *is* tested — see
-> [Verify the host half first](#0--verify-the-host-half-first). Section
-> [Verify on hardware](#5--verify-on-hardware) is ordered so the riskiest
-> assumptions fail earliest.
+> **Status: compiles, not yet flashed.** The firmware builds cleanly against
+> the real Apollo3 core 2.2.1 headers — 153,052 B flash (15%), 93,464 B RAM
+> (23%), no warnings from the sketch — which confirms the library API details
+> the guide flagged as unverified: the `ICM_20948_smplrt_t.a` field name, the
+> `agmt.acc.axes.x` accessor, the DLPF/full-scale enums, and `dataReady()`.
+> The host half is tested against synthetic streams. What still needs hardware:
+> whether `writeValue()` returns false on a full TX queue (the mechanism
+> losslessness rests on), whether `central.connected()` alone services the BLE
+> stack, the power-rail polarities, and the actual ODR. Section
+> [Verify on hardware](#5--verify-on-hardware) is ordered so those fail earliest.
 
 ```
 firmware/
@@ -190,9 +194,11 @@ status packet, so it needs no edit. Pick the smallest range your signal will not
 clip; gravity spends 1 g of the budget at all times.
 
 **Buffer depth.** `RING_SAMPLES × 6 bytes`. The default 8192 is 48 KB ≈ 29 s of
-stall tolerance out of 384 KB total. Size it from the `peak_buffer` figure the
-status packet reports rather than by guessing. Too large fails at link time, not
-at run time.
+stall tolerance. The measured build uses 93,464 B of globals and leaves
+299,752 B, so there is real headroom — 32768 samples (192 KB, ≈ 116 s) still
+leaves ~150 KB. Size it from the `peak_buffer` figure the status packet reports
+rather than by guessing, and rebuild to confirm it links: too large fails at
+link time, not at run time.
 
 ## Further reading
 

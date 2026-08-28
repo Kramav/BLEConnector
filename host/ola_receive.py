@@ -123,18 +123,19 @@ class Receiver:
 
     def on_data(self, _handle, data: bytearray):
         samples = self.asm.feed_data(bytes(data))
-        if samples:
-            now = time.monotonic()
-            if self.first_rx is None:
-                self.first_rx = now
-                self.first_index = samples[0].index
-            self.last_rx = now
-            self.last_index = samples[-1].index
         if self.asm.last_gap and not self.quiet:
             missing, seq = self.asm.last_gap
             print(f"  ! gap: {missing} packet(s) missing before seq={seq}")
-        if samples:
-            self.sink.add(samples)
+        if not samples:
+            return
+
+        now = time.monotonic()
+        if self.first_rx is None:
+            self.first_rx = now
+            self.first_index = samples[0].index
+        self.last_rx = now
+        self.last_index = samples[-1].index
+        self.sink.add(samples)
 
     def on_status(self, _handle, data: bytearray):
         status = self.asm.feed_status(bytes(data))
