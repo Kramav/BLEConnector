@@ -28,9 +28,9 @@
 // ---------------- OLA V10 pin map ----------------
 // From OpenLog_Artemis.ino at HARDWARE_VERSION_MAJOR 1 (the red board).
 // The X04 (original black) board differs -- read them out of that file.
-const byte PIN_IMU_CHIP_SELECT     = 44;
-const byte PIN_IMU_POWER           = 27;
-const byte PIN_MICROSD_CHIP_SELECT = 23;
+const byte PIN_IMU_CHIP_SELECT     = 44;   // same on both board revisions
+const byte PIN_IMU_POWER           = 27;   // V10; the X04 uses 22 -- see below
+const byte PIN_MICROSD_CHIP_SELECT = 23;   // V10; the X04 uses 10
 const byte PIN_MICROSD_POWER       = 15;
 const byte PIN_QWIIC_POWER         = 18;
 const byte PIN_SPI_CIPO            = 6;
@@ -68,9 +68,10 @@ const byte PIN_PWR_LED             = 29;
 // See the section 5 warning in the guide.
 #define EXPLICIT_BLE_POLL   0
 
-// Set to 1 to print a status line per second over USB serial. Off by
-// default: serial writes can stall the streaming loop.
-#define DEBUG_SERIAL        0
+// Print diagnostics over USB serial at 115200. On by default while the build
+// is being brought up on hardware: it costs a little loop time but turns a
+// blink code into an actual reason. Set to 0 once streaming is working.
+#define DEBUG_SERIAL        1
 
 // ---------------- BLE UUIDs (custom family) ----------------
 #define UUID_SERVICE "f1b7a2c0-9e4d-4a1f-8c3b-5d6e7f801234"
@@ -107,9 +108,10 @@ ICM_20948_Status_e configureIMU();
 void pumpIMU();
 void pumpBLE();
 void sendStatus();
-void fatalBlink(int code);
+void fatalBlink(int code, const char *why);
 void configureOutput(byte pin);
 void enableCIPOpullUp();
+void primeSpiPullUp();
 void imuPowerOn();
 void imuPowerOff();
 bool beginIMU();
@@ -125,7 +127,7 @@ void configureOutput(byte pin) {
   pin_config(PinName(pin), g_AM_HAL_GPIO_OUTPUT);
 }
 
-// A 1.5K pull-up on the shared SPI CIPO line. Without it the line can float
+// A 1.5K pull-up on the shared SPI CIPO line. Without it the line floats
 // between transfers and the IMU's WHO_AM_I read comes back as garbage, which
 // presents exactly as "IMU not found". From OpenLog_Artemis.ino's
 // enableCIPOpullUp(), updated there for Apollo3 core 2.1.0.
@@ -135,14 +137,44 @@ void enableCIPOpullUp() {
   pin_config(PinName(PIN_SPI_CIPO), cipoPinCfg);
 }
 
+// ...and the part that is impossible to guess: in the Apollo3 mbed core the
+// FIRST SPI transaction after the pull-up is configured silently switches it
+// back off. So enabling it once at startup achieves nothing -- myICM.begin()
+// issues the first transaction, loses the pull-up, and reads a floating CIPO.
+// The fix is a throwaway transaction followed by re-enabling the pull-up.
+//
+// Straight out of Firmware/Test Sketches/OLA_IMU_Basics in the OLA repo; see
+// also github.com/sparkfun/OpenLog_Artemis/issues/66. Call this before every
+// begin() attempt, not just once: each attempt spends transactions of its own.
+void primeSpiPullUp() {
+  enableCIPOpullUp();
+#if defined(ARDUINO_ARCH_MBED)
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+  SPI.endTransaction();
+  enableCIPOpullUp();
+#endif
+}
+
+// Only two pins differ between the OpenLog Artemis V10 (red) and X04 (black):
+// the IMU power rail and the microSD chip select. Everything this sketch
+// touches -- the IMU chip select, the LEDs, the SPI bus, the Qwiic and
+// microSD power pins -- is identical on both. So rather than make you know
+// which board you have, beginIMU() tries both rails and keeps the one that
+// answers. The cost of trying the wrong one is driving an unassigned pad.
+const byte IMU_POWER_PIN_CANDIDATES[] = {27, 22};   // V10 first, then X04
+const byte MICROSD_CS_CANDIDATES[]    = {23, 10};
+
+byte     activeImuPowerPin = 27;   // whichever rail actually worked
+uint32_t activeSpiHz       = 4000000;
+
 void imuPowerOn() {
-  configureOutput(PIN_IMU_POWER);
-  digitalWrite(PIN_IMU_POWER, IMU_POWER_ON_LEVEL);
+  configureOutput(activeImuPowerPin);
+  digitalWrite(activeImuPowerPin, IMU_POWER_ON_LEVEL);
 }
 
 void imuPowerOff() {
-  configureOutput(PIN_IMU_POWER);
-  digitalWrite(PIN_IMU_POWER, !IMU_POWER_ON_LEVEL);
+  configureOutput(activeImuPowerPin);
+  digitalWrite(activeImuPowerPin, !IMU_POWER_ON_LEVEL);
 }
 
 static inline uint32_t ringCount() {
@@ -168,21 +200,26 @@ void setup() {
   digitalWrite(PIN_MICROSD_POWER,
                MICROSD_POWER_OFF ? MICROSD_POWER_OFF_LEVEL : !MICROSD_POWER_OFF_LEVEL);
 
-  // Both SPI devices deselected before anything drives the bus.
-  configureOutput(PIN_MICROSD_CHIP_SELECT);
-  digitalWrite(PIN_MICROSD_CHIP_SELECT, HIGH);
+  // Every SPI device deselected before anything drives the bus. Both microSD
+  // chip-select candidates, since we do not yet know the board revision.
+  for (byte i = 0; i < sizeof(MICROSD_CS_CANDIDATES); i++) {
+    configureOutput(MICROSD_CS_CANDIDATES[i]);
+    digitalWrite(MICROSD_CS_CANDIDATES[i], HIGH);
+  }
   configureOutput(PIN_IMU_CHIP_SELECT);
   digitalWrite(PIN_IMU_CHIP_SELECT, HIGH);
 
   SPI.begin();
   delay(2);                         // stock notes SPI needs a moment here
-  enableCIPOpullUp();               // must come after SPI.begin()
+  primeSpiPullUp();                 // must come after SPI.begin()
 
-  if (!beginIMU()) fatalBlink(FAULT_IMU_NOT_FOUND);
+  if (!beginIMU()) fatalBlink(FAULT_IMU_NOT_FOUND,
+      "ICM-20948 did not respond on either board revision's power rail");
 
-  if (configureIMU() != ICM_20948_Stat_Ok) fatalBlink(FAULT_IMU_CONFIG);
+  if (configureIMU() != ICM_20948_Stat_Ok)
+    fatalBlink(FAULT_IMU_CONFIG, "IMU answered but rejected its configuration");
 
-  if (!BLE.begin()) fatalBlink(FAULT_BLE_STACK);
+  if (!BLE.begin()) fatalBlink(FAULT_BLE_STACK, "BLE.begin() failed -- check ArduinoBLE is 1.1.3");
 
   BLE.setLocalName(DEVICE_NAME);
   BLE.setDeviceName(DEVICE_NAME);
@@ -206,24 +243,45 @@ void setup() {
 // 11 ms typical and 100 ms maximum for start-up, so the first attempt waits
 // 25 ms and later ones wait the full 100 ms.
 bool beginIMU() {
-  for (int attempt = 0; attempt < 3; attempt++) {
-    imuPowerOff();
-    delay(10);
-    imuPowerOn();
-    delay(attempt == 0 ? 25 : 100);
+  const uint32_t clocks[] = {4000000, 1000000};   // 4 MHz is stock; 1 MHz is
+                                                  // the fallback for a
+                                                  // marginal bus
+  for (byte p = 0; p < sizeof(IMU_POWER_PIN_CANDIDATES); p++) {
+    activeImuPowerPin = IMU_POWER_PIN_CANDIDATES[p];
 
-    digitalWrite(PIN_IMU_CHIP_SELECT, HIGH);   // be sure it is deselected
+    for (byte c = 0; c < 2; c++) {
+      for (int attempt = 0; attempt < 2; attempt++) {
+        imuPowerOff();
+        delay(10);
+        imuPowerOn();
+        delay(attempt == 0 ? 25 : 100);
 
-    myICM.begin(PIN_IMU_CHIP_SELECT, SPI, 4000000);
-    if (myICM.status == ICM_20948_Stat_Ok) {
-      delay(25);                    // stock waits again before configuring
-      return true;
-    }
+        digitalWrite(PIN_IMU_CHIP_SELECT, HIGH);   // be sure it is deselected
+        primeSpiPullUp();           // the previous attempt consumed it
+
+        activeSpiHz = clocks[c];
+        myICM.begin(PIN_IMU_CHIP_SELECT, SPI, activeSpiHz);
+        if (myICM.status == ICM_20948_Stat_Ok) {
+          delay(25);                // stock waits again before configuring
+#if DEBUG_SERIAL
+          Serial.print("IMU found: power pin "); Serial.print(activeImuPowerPin);
+          Serial.print(" ("); Serial.print(activeImuPowerPin == 27 ? "V10" : "X04");
+          Serial.print("), SPI "); Serial.print(activeSpiHz / 1000000);
+          Serial.println(" MHz");
+#endif
+          return true;
+        }
 
 #if DEBUG_SERIAL
-    Serial.print("beginIMU attempt "); Serial.print(attempt);
-    Serial.print(" failed, status = "); Serial.println(myICM.status);
+        Serial.print("beginIMU: power pin "); Serial.print(activeImuPowerPin);
+        Serial.print(", "); Serial.print(activeSpiHz / 1000000);
+        Serial.print(" MHz, attempt "); Serial.print(attempt);
+        Serial.print(" -> status "); Serial.println(myICM.status);
 #endif
+      }
+    }
+
+    imuPowerOff();                  // leave this candidate rail off
   }
   return false;
 }
@@ -382,8 +440,18 @@ void sendStatus() {
 // ---------------------------------------------------------------------
 // Blink a fault code forever. Count the blinks between long pauses.
 //   2 = IMU not found, 3 = IMU config failed, 4 = BLE stack failed.
-void fatalBlink(int code) {
+//
+// The reason is re-printed on every cycle rather than once at boot, so a
+// serial monitor opened at any point shows why -- no need to catch the first
+// second after reset.
+void fatalBlink(int code, const char *why) {
   while (true) {
+#if DEBUG_SERIAL
+    Serial.print("FAULT "); Serial.print(code);
+    Serial.print(": "); Serial.println(why);
+#else
+    (void)why;
+#endif
     for (int i = 0; i < code; i++) {
       digitalWrite(PIN_STAT_LED, HIGH); delay(150);
       digitalWrite(PIN_STAT_LED, LOW);  delay(150);
