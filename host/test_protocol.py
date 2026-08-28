@@ -156,9 +156,10 @@ class TestReassembly(unittest.TestCase):
         """Two full wraps with a gap in each -- the accounting must add up."""
         asm = StreamAssembler()
         emitted = 0
+        dropped = {50017, 120033}
         for seq in range(140000):
-            if seq % 50000 == 17:
-                continue  # drop one packet twice in the run
+            if seq in dropped:
+                continue  # lose one packet on either side of a wrap
             asm.feed_data(packet(seq & 0xFFFF))
             emitted += 1
         self.assertEqual(asm.gap_packets, 2)

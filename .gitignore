@@ -1,0 +1,13 @@
+# Firmware build output and the OpenLog_Artemis checkout the build clones
+build/
+*.bin
+
+# Captures
+*.csv
+*.meta.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

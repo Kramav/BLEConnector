@@ -88,20 +88,32 @@ def test_rate(idx, meta, odr):
     print(f"  index span           : {idx[0]} .. {idx[-1]}  ({span} slots)")
     print(f"  missing within span  : {missing}")
 
-    if meta and meta.get("duration_s"):
-        duration = float(meta["duration_s"])
-        measured = n / duration if duration else 0.0
-        expected = odr * duration
+    duration = None
+    if meta:
+        # Prefer the streaming window: the overall duration includes the
+        # scan and connect, which would drag the measured rate down.
+        duration = meta.get("stream_duration_s") or meta.get("duration_s")
+
+    if duration:
+        duration = float(duration)
+        # Rate from the index span, not the delivered count: lost packets are
+        # test 4's business, and must not look like a wrong divider here.
+        measured = (span - 1) / duration
+        delivered = n / duration
         err = 100.0 * (measured - odr) / odr if odr else 0.0
-        print(f"  wall-clock duration  : {duration:.2f} s (from .meta.json)")
-        print(f"  expected at {odr} Hz : {expected:.0f} samples")
+        print(f"  streaming window     : {duration:.2f} s (from .meta.json)")
+        print(f"  expected at {odr} Hz : {odr * duration:.0f} samples")
         print(f"  measured rate        : {measured:.2f} Hz  ({err:+.2f}%)")
+        if delivered < measured * 0.999:
+            print(f"  delivered rate       : {delivered:.2f} Hz (after packet loss)")
         if abs(err) <= 1.0:
             print("  PASS  within 1% of the configured ODR")
         else:
             print(
                 "  FAIL  more than 1% off. Check ACCEL_SMPLRT_DIV, and whether\n"
-                "        setSampleRate() took (ICM_20948_smplrt_t field name)."
+                "        setSampleRate() took (ICM_20948_smplrt_t field name).\n"
+                "        Consistently low with no gaps means the polled read loop\n"
+                "        is missing samples -- see the guide's FIFO path."
             )
     else:
         print("  (no .meta.json sidecar -- cannot check the rate against a clock)")

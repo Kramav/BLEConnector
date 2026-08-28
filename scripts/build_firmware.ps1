@@ -37,9 +37,43 @@ if (-not $OlaRepo) { $OlaRepo = Join-Path $buildDir 'OpenLog_Artemis' }
 $container = 'ola_accel_container'
 $binName   = 'OLA_Accel_BLE.ino.bin'
 
-function Assert-LastExitCode {
-    param([string] $What)
-    if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
+# Windows PowerShell 5.1 wraps a native command's stderr in ErrorRecords when
+# its output is redirected, which under $ErrorActionPreference='Stop' aborts on
+# perfectly normal output -- `docker build --progress=plain` writes everything
+# to stderr. Run native tools with the preference relaxed and judge them by
+# their exit code instead, which is the only thing that actually means failure.
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory)][string] $Exe,
+        [string[]] $Arguments = @(),
+        [switch] $Quiet
+    )
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($Quiet) {
+            & $Exe @Arguments 2>&1 | Out-Null
+        } else {
+            & $Exe @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
+        }
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    return $LASTEXITCODE
+}
+
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory)][string] $Exe,
+        [string[]] $Arguments = @(),
+        [switch] $Quiet,
+        [string] $What
+    )
+    $code = Invoke-Native -Exe $Exe -Arguments $Arguments -Quiet:$Quiet
+    if ($code -ne 0) {
+        if (-not $What) { $What = "$Exe $($Arguments -join ' ')" }
+        throw "$What failed (exit $code)"
+    }
 }
 
 # --- prerequisites ----------------------------------------------------
@@ -49,16 +83,19 @@ foreach ($exe in @('docker', 'git')) {
     }
 }
 
-docker info *> $null
-if ($LASTEXITCODE -ne 0) { throw 'Docker is installed but not running. Start Docker Desktop and retry.' }
+if ((Invoke-Native -Exe 'docker' -Arguments @('info') -Quiet) -ne 0) {
+    throw 'Docker is installed but its daemon is not responding. Start Docker Desktop, wait for the whale icon to settle, and retry.'
+}
 
 if (-not (Test-Path $buildDir)) { New-Item -ItemType Directory -Path $buildDir | Out-Null }
 
 # --- OpenLog_Artemis checkout (we need Extras/UartPower3.zip) ----------
 if (-not (Test-Path $OlaRepo)) {
     Write-Host "Cloning OpenLog_Artemis into $OlaRepo ..." -ForegroundColor Cyan
-    git clone --depth 1 https://github.com/sparkfun/OpenLog_Artemis.git $OlaRepo
-    Assert-LastExitCode 'git clone'
+    Invoke-NativeChecked -Exe 'git' -Arguments @(
+        'clone', '--depth', '1',
+        'https://github.com/sparkfun/OpenLog_Artemis.git', $OlaRepo
+    ) -What 'git clone'
 } else {
     Write-Host "Reusing existing checkout at $OlaRepo" -ForegroundColor DarkGray
 }
@@ -77,33 +114,27 @@ Copy-Item (Join-Path $repoRoot 'firmware\OLA_Accel_BLE\*') $stagedSketch -Recurs
 Copy-Item (Join-Path $repoRoot 'firmware\Dockerfile.accel') $fwDir -Force
 
 # --- build -------------------------------------------------------------
-Write-Host "Building image '$Tag' ..." -ForegroundColor Cyan
+Write-Host "Building image '$Tag' (first run installs the Apollo3 core -- slow) ..." -ForegroundColor Cyan
 $buildArgs = @('build', '-f', 'Dockerfile.accel', '-t', $Tag, '--progress=plain')
 if ($NoCache) { $buildArgs += '--no-cache' }
 $buildArgs += '.'
 
 Push-Location $fwDir
 try {
-    & docker @buildArgs
-    Assert-LastExitCode 'docker build'
+    Invoke-NativeChecked -Exe 'docker' -Arguments $buildArgs -What 'docker build'
 } finally {
     Pop-Location
 }
 
 # --- extract the binary ------------------------------------------------
-docker rm -f $container *> $null   # ignore failure: it usually does not exist
-$LASTEXITCODE = 0
-
-docker create --name=$container "${Tag}:latest" | Out-Null
-Assert-LastExitCode 'docker create'
+Invoke-Native -Exe 'docker' -Arguments @('rm', '-f', $container) -Quiet | Out-Null
+Invoke-NativeChecked -Exe 'docker' -Arguments @('create', "--name=$container", "${Tag}:latest") -Quiet -What 'docker create'
 
 $outPath = Join-Path $buildDir $binName
 try {
-    docker cp "${container}:/$binName" $outPath
-    Assert-LastExitCode 'docker cp'
+    Invoke-NativeChecked -Exe 'docker' -Arguments @('cp', "${container}:/$binName", $outPath) -What 'docker cp'
 } finally {
-    docker rm $container *> $null
-    $LASTEXITCODE = 0
+    Invoke-Native -Exe 'docker' -Arguments @('rm', $container) -Quiet | Out-Null
 }
 
 $size = (Get-Item $outPath).Length

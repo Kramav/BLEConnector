@@ -1,0 +1,8 @@
+# Host-side dependencies for the OLA-ACCEL receiver and analyser.
+#   pip install -r host/requirements.txt
+
+bleak>=0.21.0      # cross-platform BLE; ola_receive.py, ola_scan.py
+numpy>=1.22        # ola_analyze.py
+
+# Optional: only needed for `ola_analyze.py --plot`
+# matplotlib>=3.5

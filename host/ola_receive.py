@@ -23,7 +23,8 @@ from datetime import datetime, timezone
 try:
     from bleak import BleakClient, BleakScanner
 except ImportError:  # pragma: no cover - dependency hint
-    sys.exit("bleak is not installed.  pip install -r requirements.txt")
+    # Deferred so ola_simulate.py can reuse the CSV pipeline without bleak.
+    BleakClient = BleakScanner = None
 
 from ola_protocol import (
     DEVICE_NAME,
@@ -112,9 +113,23 @@ class Receiver:
         self.sink = sink
         self.asm = assembler
         self.quiet = quiet
+        # Arrival times of the first and last data notification. The rate
+        # check needs the streaming window alone -- scanning and connecting
+        # can take seconds and would drag the measured rate down.
+        self.first_rx = None
+        self.last_rx = None
+        self.first_index = None
+        self.last_index = None
 
     def on_data(self, _handle, data: bytearray):
         samples = self.asm.feed_data(bytes(data))
+        if samples:
+            now = time.monotonic()
+            if self.first_rx is None:
+                self.first_rx = now
+                self.first_index = samples[0].index
+            self.last_rx = now
+            self.last_index = samples[-1].index
         if self.asm.last_gap and not self.quiet:
             missing, seq = self.asm.last_gap
             print(f"  ! gap: {missing} packet(s) missing before seq={seq}")
@@ -128,6 +143,11 @@ class Receiver:
         self.sink.mark_primed()
         if not self.quiet:
             print(f"  status: {status.describe()}")
+
+
+def require_bleak():
+    if BleakScanner is None:
+        sys.exit("bleak is not installed.  pip install -r host/requirements.txt")
 
 
 async def find_device(args):
@@ -146,11 +166,12 @@ async def find_device(args):
 
 
 async def stream(args):
+    require_bleak()
     asm = StreamAssembler()
     device = await find_device(args)
 
     started_wall = datetime.now(timezone.utc)
-    t0 = time.monotonic()
+    t0 = time.monotonic()  # reset below, once notifications are actually on
 
     with CsvSink(args.out, asm, include_raw=args.raw) as sink:
         rx = Receiver(sink, asm, quiet=args.quiet)
@@ -164,6 +185,8 @@ async def stream(args):
         async with BleakClient(device, disconnected_callback=on_disconnect) as client:
             await client.start_notify(UUID_STATUS, rx.on_status)
             await client.start_notify(UUID_DATA, rx.on_data)
+            started_wall = datetime.now(timezone.utc)
+            t0 = time.monotonic()
 
             how_long = "until Ctrl-C" if args.seconds <= 0 else f"for {args.seconds} s"
             print(f"streaming {how_long} -> {args.out}   (Ctrl-C to stop)")
@@ -188,20 +211,48 @@ async def stream(args):
                     pass
 
     elapsed = time.monotonic() - t0
-    report(args, asm, sink, started_wall, elapsed)
+    report(args, asm, sink, rx, started_wall, elapsed)
 
 
-def report(args, asm, sink, started_wall, elapsed):
+def stream_duration(rx):
+    """Seconds between the first and last data notification, or None."""
+    if rx.first_rx is None or rx.last_rx is None:
+        return None
+    return rx.last_rx - rx.first_rx
+
+
+def measured_odr(asm, rx):
+    """Sample rate from the index span over the streaming window.
+
+    Uses the span rather than the number of samples delivered, so lost
+    packets show up as loss (test 4) instead of masquerading as a wrong
+    ACCEL_SMPLRT_DIV (test 3).
+    """
+    window = stream_duration(rx)
+    if not window or rx.first_index is None:
+        return None
+    spanned = rx.last_index - rx.first_index
+    if spanned <= 0:
+        return None
+    return spanned / window
+
+
+def report(args, asm, sink, rx, started_wall, elapsed):
     print(f"\nwrote {sink.rows_written} samples to {args.out}")
     print(
         f"missing {asm.missing_samples} samples "
         f"({asm.loss_percent:.4f}%) across {asm.gap_packets} lost packet(s)"
     )
-    if elapsed > 0:
+    odr_hat = measured_odr(asm, rx)
+    window = stream_duration(rx)
+    if odr_hat is not None:
+        err = 100.0 * (odr_hat - asm.odr_hz) / asm.odr_hz
         print(
-            f"host-observed rate {sink.rows_written / elapsed:.2f} Hz "
-            f"over {elapsed:.1f} s  (firmware ODR {asm.odr_hz} Hz)"
+            f"measured rate {odr_hat:.2f} Hz over {window:.1f} s of streaming "
+            f"({err:+.2f}% vs the firmware's {asm.odr_hz} Hz)"
         )
+    elif elapsed > 0:
+        print(f"captured for {elapsed:.1f} s (firmware ODR {asm.odr_hz} Hz)")
     if asm.malformed_packets:
         print(f"! {asm.malformed_packets} malformed packet(s)")
     if asm.last_status is None:
@@ -215,6 +266,8 @@ def report(args, asm, sink, started_wall, elapsed):
     meta = {
         "started_utc": started_wall.isoformat(),
         "duration_s": round(elapsed, 3),
+        "stream_duration_s": round(window, 3) if window else None,
+        "measured_odr_hz": round(odr_hat, 4) if odr_hat else None,
         "device_name": args.name,
         "odr_hz": asm.odr_hz,
         "full_scale_g": asm.full_scale_g,
