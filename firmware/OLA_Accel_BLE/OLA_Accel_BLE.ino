@@ -63,10 +63,11 @@ const byte PIN_PWR_LED             = 29;
 #define RING_SAMPLES        8192        // 8192 * 6 B = 48 KB ~= 29 s
 #define STATUS_INTERVAL_MS  1000
 
-// Set to 1 if the link stalls or drops a second or two after connecting --
-// on some ports central.connected() does not service the stack on its own.
+// Poll the BLE stack explicitly each pass. central.connected() polls
+// internally, but an extra poll costs almost nothing and removes a whole
+// class of stalls where the link drops a second or two after connecting.
 // See the section 5 warning in the guide.
-#define EXPLICIT_BLE_POLL   0
+#define EXPLICIT_BLE_POLL   1
 
 // Print diagnostics over USB serial at 115200. On by default while the build
 // is being brought up on hardware: it costs a little loop time but turns a
@@ -313,6 +314,18 @@ ICM_20948_Status_e configureIMU() {
 }
 
 // ---------------------------------------------------------------------
+// NEVER let this loop spin without yielding.
+//
+// ArduinoBLE's Apollo3 port does not run the Bluetooth stack in your loop --
+// HCICordioTransport.cpp starts an mbed RTOS thread (bleLoopThread) that owns
+// the Cordio stack. On this core delay() is rtos::ThisThread::sleep_for(),
+// which yields the CPU; a bare busy-loop never does. Starve that thread and
+// the link layer still connects -- interrupts keep running -- but GATT stops:
+// service discovery times out, and the CCCD write that makes subscribed()
+// true never gets processed. The board looks connected and streams nothing.
+//
+// Every delay() below is load-bearing. Removing them reproduces a bug that
+// presents as a host-side timeout, which is the wrong place to look.
 void loop() {
   BLEDevice central = BLE.central();
 
@@ -337,17 +350,47 @@ void loop() {
 #endif
 
   uint32_t lastStatus = millis();
+  bool streaming = false;
 
   while (central.connected()) {
 #if EXPLICIT_BLE_POLL
     BLE.poll();
 #endif
+
+    // Do not read the IMU or transmit anything until the central has actually
+    // subscribed. A central spends the first seconds after connecting on
+    // service discovery -- a burst of ATT requests it expects answered
+    // promptly. Streaming into a characteristic nobody has subscribed to
+    // during that window accomplishes nothing and can starve discovery badly
+    // enough that the central gives up and reports a connection timeout.
+    if (!streaming) {
+      if (!dataChar.subscribed()) {
+        delay(1);                     // MUST yield -- see the note above loop()
+        continue;
+      }
+
+      streaming = true;
+      head = tail = 0;
+      totalSamples = droppedSamples = highWater = 0;
+      seq = 0; flags = 0;
+      myICM.getAGMT();                // discard anything sampled while waiting
+      lastStatus = millis();
+#if DEBUG_SERIAL
+      Serial.println("subscribed -- streaming");
+#endif
+    }
+
     pumpIMU();
     pumpBLE();
     if (millis() - lastStatus >= STATUS_INTERVAL_MS) {
       sendStatus();
       lastStatus = millis();
     }
+
+    // Yield every pass. At 281.25 Hz a 1 ms cadence is ~3.5x faster than
+    // samples arrive, and pumpBLE() drains as many packets as the stack will
+    // take per pass, so this costs no throughput.
+    delay(1);
   }
 
   digitalWrite(PIN_STAT_LED, LOW);

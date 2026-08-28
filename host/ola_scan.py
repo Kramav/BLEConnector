@@ -14,10 +14,11 @@ once-every-two-seconds blink means the firmware is healthy and advertising.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 
-from ola_ble import BleakScanner, require_bleak, run
-from ola_protocol import DEVICE_NAME, UUID_SERVICE
+from ola_ble import BleakClient, BleakScanner, require_bleak, run
+from ola_protocol import DEVICE_NAME, UUID_DATA, UUID_SERVICE, UUID_STATUS
 
 
 async def scan(args):
@@ -58,13 +59,101 @@ async def scan(args):
     return 0
 
 
+async def inspect(args):
+    """Connect and report the real GATT table, then test-subscribe.
+
+    Separates "the firmware's services are wrong" from "streaming is broken",
+    which a failed ola_receive.py run cannot distinguish on its own.
+    """
+    require_bleak()
+    print(f"scanning for {args.name} ...")
+    dev = await BleakScanner.find_device_by_name(args.name, timeout=args.timeout)
+    if dev is None:
+        print(f"NOT FOUND: no peripheral named {args.name}.")
+        return 1
+
+    print(f"connecting to {dev.address} ...\n")
+    async with BleakClient(dev) as client:
+        print(f"connected: {client.is_connected}\n")
+
+        wanted = {
+            UUID_SERVICE.lower(): "service",
+            UUID_DATA.lower(): "data characteristic",
+            UUID_STATUS.lower(): "status characteristic",
+        }
+        seen = set()
+
+        for service in client.services:
+            mark = " <-- OLA-ACCEL" if service.uuid.lower() in wanted else ""
+            seen.add(service.uuid.lower())
+            print(f"service {service.uuid}{mark}")
+            for ch in service.characteristics:
+                mark = " <--" if ch.uuid.lower() in wanted else ""
+                seen.add(ch.uuid.lower())
+                props = ",".join(ch.properties)
+                print(f"    char {ch.uuid}  [{props}]{mark}")
+        print()
+
+        missing = [f"{uuid} ({what})" for uuid, what in wanted.items() if uuid not in seen]
+        if missing:
+            print("MISSING from the GATT table:")
+            for m in missing:
+                print(f"  {m}")
+            print(
+                "\nThe board is not running the expected firmware, or Windows is "
+                "serving a\ncached GATT table -- forget the device in Bluetooth "
+                "settings and retry."
+            )
+            return 1
+
+        print("all expected UUIDs present. subscribing for 5 s ...")
+        counts = {"data": 0, "status": 0, "bytes": 0}
+
+        def on_data(_c, d):
+            counts["data"] += 1
+            counts["bytes"] += len(d)
+            if counts["data"] == 1:
+                print(f"  first data packet: {len(d)} bytes  {bytes(d).hex()}")
+
+        def on_status(_c, d):
+            counts["status"] += 1
+            print(f"  status packet: {len(d)} bytes  {bytes(d).hex()}")
+
+        await client.start_notify(UUID_STATUS, on_status)
+        await client.start_notify(UUID_DATA, on_data)
+        await asyncio.sleep(5.0)
+        if client.is_connected:
+            await client.stop_notify(UUID_DATA)
+            await client.stop_notify(UUID_STATUS)
+
+    print(
+        f"\n{counts['data']} data packets ({counts['bytes']} bytes), "
+        f"{counts['status']} status packets in 5 s"
+    )
+    if counts["data"] == 0:
+        print(
+            "\nSubscribed but nothing arrived. The firmware only streams while a\n"
+            "central is connected -- check the status LED is solid, not blinking."
+        )
+        return 1
+    rate = counts["data"] * 3 / 5.0
+    print(f"~{rate:.0f} samples/s (expect ~281). Streaming works.")
+    return 0
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("-t", "--timeout", type=float, default=10.0, help="scan seconds")
     p.add_argument("--name", default=DEVICE_NAME, help="local name to look for")
     p.add_argument("--all", action="store_true", help="also list other devices")
+    p.add_argument(
+        "--connect",
+        action="store_true",
+        help="connect and dump the GATT table, then test-subscribe",
+    )
     return p.parse_args(argv)
 
 
 if __name__ == "__main__":
-    sys.exit(run(scan(parse_args())))
+    _args = parse_args()
+    sys.exit(run(inspect(_args) if _args.connect else scan(_args)))

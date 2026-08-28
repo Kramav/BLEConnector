@@ -73,13 +73,21 @@ def explain(exc: Exception) -> str:
             "  BLE peripherals accept one central at a time."
         )
 
-    if name == "BleakCharacteristicNotFoundError":
-        return (
+    if name == "BleakCharacteristicNotFoundError" or "not found" in low:
+        msg = (
             f"{text}\n"
-            "  Connected, but the OLA-ACCEL service is missing. Is this the "
-            "right device,\n"
-            "  and is it running the firmware from firmware/OLA_Accel_BLE?"
+            "  Connected, but that characteristic is not in the GATT table.\n"
+            "  Run:  python host/ola_scan.py --connect   to see what the board "
+            "actually exposes."
         )
+        if sys.platform == "win32":
+            msg += (
+                "\n  Windows also caches a device's GATT table: if the firmware's "
+                "services\n"
+                "  changed since the last connection, forget the device under\n"
+                "  Settings > Bluetooth & devices and try again."
+            )
+        return msg
 
     if "access is denied" in low or "permission" in low:
         if sys.platform == "darwin":
@@ -105,13 +113,14 @@ def run(coro) -> int:
     """
     try:
         result = asyncio.run(coro)
-    except BleakError as exc:
-        print(f"\nBLE error: {explain(exc)}", file=sys.stderr)
-        return 1
     except KeyboardInterrupt:
         return 130
-    except OSError as exc:
-        # WinRT surfaces some radio failures as bare OSErrors.
-        print(f"\nBLE error: {explain(exc)}", file=sys.stderr)
+    except (BleakError, OSError) as exc:
+        # The class name matters when diagnosing: it separates "no such
+        # characteristic" from "the link dropped" from "the radio is off".
+        print(
+            f"\nBLE error [{type(exc).__name__}]: {explain(exc)}",
+            file=sys.stderr,
+        )
         return 1
     return 0 if result is None else int(result)

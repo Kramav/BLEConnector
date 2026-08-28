@@ -189,13 +189,21 @@ packets never arrived. In a healthy run both are zero.
 4. **Confirm the board revision.** `PIN_IMU_CHIP_SELECT` is 44 on the V10; the
    X04 differs, and every pin in the map is then wrong.
 
-Three things the sketch already does, which are easy to lose if you edit setup()
-and are exactly what stock firmware does — see `beginIMU()` in
-`OpenLog_Artemis.ino` and `imuPowerOn()` in `lowerPower.ino`: every `pinMode`
-is paired with `pin_config()` (on Apollo3 `pinMode` alone may not re-configure a
-pad, so a rail looks driven in code and reads dead on the board); the CIPO line
-gets a 1.5K pull-up *after* `SPI.begin()`; and the ICM is power-cycled before
-each `begin()` attempt rather than merely powered on.
+**The CIPO pull-up quirk — do not remove `primeSpiPullUp()`.** In the Apollo3
+mbed core, *the first SPI transaction after the CIPO pull-up is configured
+silently switches it back off.* Enabling the pull-up once at startup therefore
+achieves nothing: `myICM.begin()` issues that first transaction, loses the
+pull-up, reads a floating CIPO, gets a garbage `WHO_AM_I`, and reports failure —
+indistinguishable from an absent or unpowered IMU. The workaround is a throwaway
+transaction followed by re-enabling the pull-up, before **every** `begin()`
+attempt, since each attempt spends transactions of its own. Source:
+`Firmware/Test Sketches/OLA_IMU_Basics` in the OLA repo and
+[issue #66](https://github.com/sparkfun/OpenLog_Artemis/issues/66).
+
+The sketch also power-cycles the ICM before each `begin()` attempt rather than
+merely powering it on (stock does this too — a warm restart can leave the part
+unresponsive), and pairs every `pinMode` with `pin_config()` as stock firmware
+does throughout `lowerPower.ino`.
 
 The `⚠️` items in the guide's [§12](openlog-artemis-ble-streaming-guide.md) list
 exactly which API details are unverified: the `ICM_20948_smplrt_t.a` field name,
